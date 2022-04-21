@@ -16,6 +16,7 @@ def evaluate_loss(args, model, loader, dataset=None, exemplars_embedding=None):
 
     for data in loader:
         if len(data) == 3:
+            
             data, _, _ = data
         else:
             data, _ = data
