@@ -10,8 +10,8 @@ class dynamic_mnist_loader(base_load_data):
         super(dynamic_mnist_loader, self).__init__(args, use_fixed_validation, no_binarization=no_binarization)
 
     def obtain_data(self):
-        train = datasets.MNIST(os.path.join('datasets', self.args.dataset_name), train=True, download=True)
-        test = datasets.MNIST(os.path.join('datasets', self.args.dataset_name), train=False)
+        train = datasets.MNIST('/home/qingzhong/data', train=True, download=True)
+        test = datasets.MNIST('/home/qingzhong/data', train=False)
         return train, test
 
 

@@ -26,7 +26,7 @@ def log_normal_diag_vectorized(x, mean, log_var):
 
 
 def log_normal_diag(x, mean, log_var, average=False, dim=None):
-    log_normal = -0.5 * (log_var + log_2_pi + torch.pow( x - mean, 2 ) / torch.exp( log_var ) )
+    log_normal = -0.5 * (log_var + log_2_pi + torch.pow( x - mean, 2) / torch.exp( log_var ) )
     if average:
         return torch.mean(log_normal, dim)
     else:
@@ -65,3 +65,19 @@ def log_logistic_256(x, mean, logvar, average=False, reduce=True, dim=None):
     else:
         return torch.sum(log_logist_256, dim)
 
+# def test():
+#     # z = torch.randn(1)
+#     z_mean = torch.randn(10, 10)
+#     z_logvar = -torch.ones(10) * 1
+#     z_logvar = z_logvar.unsqueeze(0)
+#     z = torch.randn(20, 10)
+#     prob, _ = log_normal_diag_vectorized(z, z_mean, z_logvar)
+#     print(prob)
+#     prob_max, _ = torch.max(prob, 1)
+#     # print(prob_max)
+#     # print(prob - prob_max.unsqueeze(1))
+#     prob = torch.exp(prob - prob_max.unsqueeze(1))
+#     print(prob.shape)
+#     print(prob)
+
+# test()

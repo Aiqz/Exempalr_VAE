@@ -64,6 +64,15 @@ def load_all_pseudo_input(args, model, dataset):
         embedding = model.q_z(pseudo_means, prior=True)  # C x M
     elif args.prior == 'standard':
         embedding = None
+    elif args.prior == 'trans_exemplar_prior':
+        exemplars_z, exemplars_log_var = model.cache_z(dataset)
+        embedding = (exemplars_z, exemplars_log_var)
+    elif args.prior == 'h_vae':
+        exemplars_z, exemplars_log_var = model.cache_z(dataset)
+        exemplars_z = exemplars_z / exemplars_z.norm(dim=-1, keepdim=True)
+        exemplars_log_var = F.softplus(exemplars_log_var) + 1
+        # exemplars_kappa = torch.exp(exemplars_log_var)
+        embedding = (exemplars_z, exemplars_log_var)
     else:
         raise Exception("wrong name of prior")
     return embedding

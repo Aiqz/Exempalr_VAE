@@ -70,7 +70,7 @@ parser.add_argument('--dynamic_binarization', action='store_true', default=False
 parser.add_argument('--seed', type=int, default=14, metavar='S',
                     help='random seed (default: 14)')
 
-parser.add_argument('--no_mask', action='store_true', default=False, help='no leave one out')
+parser.add_argument('--no_mask', action='store_true', default=True, help='no leave one out')
 
 parser.add_argument('--parent_dir', type=str, default='')
 parser.add_argument('--same_variational_var', type=str2bool, default=False,
@@ -184,6 +184,8 @@ def run_density_estimation(args, train_loader_input, val_loader_input, test_load
 
             if args.prior == 'exemplar_prior':
                 print("Prior Variance", model.prior_log_variance.item())
+            if args.prior == 'trans_exemplar_prior':
+                print("Prior Variance", model.prior_log_variance.item())
             if args.continuous is True:
                 print("Decoder Variance", model.decoder_logstd.item())
             print(epoch_report)
@@ -221,6 +223,7 @@ def run(args, kwargs):
                   + '_(components_' + str(args.number_components) + ', lr=' + str(args.lr) + ')'
     snapshots_path = os.path.join(args.base_dir, args.parent_dir) + '/'
     dir = snapshots_path + args.model_signature + '_' + model_name + '_' + args.parent_dir + '/'
+    # dir = 'snapshots/h_vae_on_dynamic_mnist_model_name=vae/2022-04-18 14:38:55_dynamic_mnist_vae_h_vae_(components_50000, lr=0.0005)_h_vae_on_dynamic_mnist_model_name=vae/'
 
     if args.just_evaluate:
         config = torch.load(dir + args.model_name + '.config')

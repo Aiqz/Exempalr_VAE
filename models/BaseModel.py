@@ -1,8 +1,10 @@
 from __future__ import print_function
+from more_itertools import first
 import numpy as np
 import torch
 import torch.utils.data
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.autograd import Variable
 from utils.nn import normal_init, NonLinear
 from utils.distributions import log_normal_diag_vectorized
@@ -10,7 +12,9 @@ import math
 from utils.nn import he_init
 from utils.distributions import pairwise_distance
 from utils.distributions import log_bernoulli, log_normal_diag, log_normal_standard, log_logistic_256
+from utils.distributions_hypervae import *
 from abc import ABC, abstractmethod
+from torchvision import transforms
 
 
 class BaseModel(nn.Module, ABC):
@@ -23,6 +27,12 @@ class BaseModel(nn.Module, ABC):
             self.add_pseudoinputs()
 
         if self.args.prior == 'exemplar_prior':
+            self.prior_log_variance = torch.nn.Parameter(torch.randn((1)))
+        
+        if self.args.prior == 'trans_exemplar_prior':
+            self.prior_log_variance = torch.nn.Parameter(torch.randn((1)))
+
+        if self.args.prior == 'h_vae':
             self.prior_log_variance = torch.nn.Parameter(torch.randn((1)))
 
         if self.args.input_type == 'binary':
@@ -50,7 +60,42 @@ class BaseModel(nn.Module, ABC):
     @abstractmethod
     def kl_loss(self, latent_stats, exemplars_embeddin, dataset, cache, x_indices):
         pass
+    
+    def kl_loss_hyperVAE(self, latent_stats):
+        _, z_q_mean, z_q_logvar = latent_stats
+        q_z = VonMisesFisher(z_q_mean, z_q_logvar)
+        p_z = HypersphericalUniform(self.args.z1_size - 1, device='cuda')
+        KL = torch.distributions.kl.kl_divergence(q_z, p_z)
+        return KL
+    
+    def kl_loss_trans_exemplar_hyper(self, latent_stats, exemplars_embedding, x=None):
+        _, z_q_mean, z_q_logvar = latent_stats
+        # z_q_var = torch.exp(z_q_logvar)
+        q_z = VonMisesFisher(z_q_mean, z_q_logvar)
+        first_part = -q_z.entropy()
+        if exemplars_embedding == None:
+            exemplars_embedding = self.get_trans_exemplar_set(x)
+        
+        set_mu, kappa = exemplars_embedding # set_mu:[M * D_z] kappa:scale z_q_mean:[B * D_z]
+        # kappa = torch.exp(log_kappa)
+        z_dim = z_q_mean.shape[-1]
 
+        second_1 = kappa * ive(z_dim, z_q_logvar) / ive((z_dim / 2) - 1, z_q_logvar)
+
+        second_2 = torch.mm(z_q_mean, set_mu.T)
+
+        second_part = second_1 * second_2
+        second_part = torch.log(torch.sum(torch.exp(second_part), dim=1))
+        third_part = (z_dim / 2 - 1) * torch.log(kappa) - (z_dim / 2) * math.log(2 * math.pi) - (kappa + torch.log(ive(z_dim / 2 - 1, kappa)))
+        forth_part = torch.log(torch.FloatTensor([len(set_mu)])).to(self.args.device)
+        # print("first:", first_part.mean())
+        # print("second:", second_part.mean())
+        # print("third:", third_part)
+        # print("forth:", forth_part)
+
+        KL = first_part - second_part - third_part + forth_part
+        return KL
+        
     def reconstruction_loss(self, x, x_mean, x_logvar):
         if self.args.input_type == 'binary':
             return log_bernoulli(x, x_mean, dim=1)
@@ -67,8 +112,12 @@ class BaseModel(nn.Module, ABC):
         x, x_indices = x
         x_mean, x_logvar, latent_stats = self.forward(x)
         RE = self.reconstruction_loss(x, x_mean, x_logvar)
-        KL = self.kl_loss(latent_stats, exemplars_embedding, dataset, cache, x_indices)
-        loss = -RE + beta*KL
+        if self.args.prior == 'h_vae':
+            KL = self.kl_loss_trans_exemplar_hyper(latent_stats, exemplars_embedding, x)
+            # KL = self.kl_loss_hyperVAE(latent_stats)
+        else:
+            KL = self.kl_loss(latent_stats, exemplars_embedding, dataset, cache, x_indices, x)
+        loss = -RE + beta * KL
         if average:
             loss = torch.mean(loss)
             RE = torch.mean(RE)
@@ -94,6 +143,28 @@ class BaseModel(nn.Module, ABC):
         means = z_p_mean.unsqueeze(0)
         logvars = z_p_logvar.unsqueeze(0)
         return log_normal_diag(z_expand, means, logvars, dim=2) - math.log(C)
+    
+    def log_p_z_trans_exemplar_vector(self, z, exemplars_embedding, test):
+        centers, center_log_variance = exemplars_embedding
+        center_log_variance = center_log_variance[0, :].unsqueeze(0)
+        # print(z.shape) # [100, 40]
+        # print(centers.shape) # [600, 40]
+        # print(center_log_variance.shape) # [1, 40]
+        # print(center_log_variance)
+        prob, _ = log_normal_diag_vectorized(z, centers, center_log_variance)  # MB x C
+        # print("prob", prob.shape) # [100, 600]
+        if test:
+            denominator = torch.tensor(len(centers)).expand(len(z)).float().to(self.args.device)
+        else:
+            denominator = torch.tensor(len(centers) / self.args.batch_size).expand(len(z)).float().to(self.args.device)
+            # extract prob
+            prob_list = []
+            for i in range(prob.shape[0]):
+                index = [i + k for k in range(0, prob.shape[1], self.args.batch_size)]
+                prob_list.append(prob[i:i+1,index])
+            prob = torch.cat(prob_list, dim=0)
+        prob -= torch.log(denominator).unsqueeze(1)
+        return prob
 
     def log_p_z_exemplar(self, z, z_indices, exemplars_embedding, test):
         centers, center_log_variance, center_indices = exemplars_embedding
@@ -118,6 +189,9 @@ class BaseModel(nn.Module, ABC):
             prob = self.log_p_z_vampprior(z, exemplars_embedding)
         elif self.args.prior == 'exemplar_prior':
             prob = self.log_p_z_exemplar(z, z_indices, exemplars_embedding, test)
+        elif self.args.prior == 'trans_exemplar_prior':
+            prob = self.log_p_z_trans_exemplar_vector(z, exemplars_embedding, test)
+            
         else:
             raise Exception('Wrong name of the prior!')
         if sum:
@@ -163,6 +237,22 @@ class BaseModel(nn.Module, ABC):
             z_sample_gen_mean, z_sample_gen_logvar = self.q_z(exemplars.to(self.args.device), prior=True)
             z_sample_rand = self.reparameterize(z_sample_gen_mean, z_sample_gen_logvar)
             z_sample_rand = z_sample_rand.to(self.args.device)
+        elif self.args.prior == 'trans_exemplar_prior':
+            rand_indices = torch.randint(low=0, high=self.args.training_set_size, size=(N,))
+            exemplars = dataset.tensors[0][rand_indices]
+            z_sample_gen_mean, z_sample_gen_logvar = self.q_z(exemplars.to(self.args.device), prior=True)
+            z_sample_rand = self.reparameterize(z_sample_gen_mean, z_sample_gen_logvar)
+            z_sample_rand = z_sample_rand.to(self.args.device)
+        elif self.args.prior == 'h_vae':
+            output = (
+                torch.distributions.Normal(0, 1)
+                .sample(
+                    torch.Size([N]) + torch.Size([self.args.z1_size])
+                )
+                .to(self.args.device)
+            )
+            z_sample_rand = output / output.norm(dim=-1, keepdim=True)
+        
         return z_sample_rand
 
     def reference_based_generation_z(self, N=25, reference_image=None):
@@ -214,11 +304,18 @@ class BaseModel(nn.Module, ABC):
                 z_q_logvar = self.prior_log_variance * torch.ones((x.shape[0], self.args.z1_size)).to(self.args.device)
                 if self.args.model_name == 'newconvhvae_2level':
                     z_q_logvar = z_q_logvar.reshape(-1, 4, 4, 4)
+            elif self.args.prior == 'trans_exemplar_prior':
+                z_q_logvar = self.prior_log_variance * torch.ones((x.shape[0], self.args.z1_size)).to(self.args.device)
+            elif self.args.prior == 'h_vae':
+                z_q_logvar = self.prior_log_variance
             else:
                 z_q_logvar = self.q_z_logvar(h)
         else:
             z_q_logvar = self.q_z_logvar(h)
-        return z_q_mean.reshape(-1, self.args.z1_size), z_q_logvar.reshape(-1, self.args.z1_size)
+        if self.args.prior == 'h_vae':
+            return z_q_mean, z_q_logvar
+        else:
+            return z_q_mean.reshape(-1, self.args.z1_size), z_q_logvar.reshape(-1, self.args.z1_size)
 
     def cache_z(self, dataset, prior=True, cuda=True):
         cached_z = []
@@ -233,7 +330,10 @@ class BaseModel(nn.Module, ABC):
 
             exemplars_embedding, log_variance_z = self.q_z(batch_data.to(self.args.device), prior=prior)
             cached_z.append(exemplars_embedding)
-            cached_log_var.append(log_variance_z)
+            if self.args.prior != 'h_vae':
+                cached_log_var.append(log_variance_z)
+            elif i == 0:
+                cached_log_var.append(log_variance_z)
         cached_z = torch.cat(cached_z, dim=0)
         cached_log_var = torch.cat(cached_log_var, dim=0)
         cached_z = cached_z.to(self.args.device)
@@ -252,6 +352,45 @@ class BaseModel(nn.Module, ABC):
                 dataset=dataset,
                 cache=cache)
         return exemplar_set
+    
+    def images_transfroms(self, input_images, num_iter=1, with_input = True):
+
+
+        transform = transforms.Compose([
+                # transforms.RandomResizedCrop(size=28),
+                transforms.RandomResizedCrop(size=28, scale=(0.08, 0.2)),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomRotation(degrees=25),
+                transforms.GaussianBlur(kernel_size=3),
+                # transforms.RandomGrayscale(p=0.2),
+                ])
+        
+        
+        for i in range(num_iter):
+            output_image = transform(input_images)
+            if i == 0:
+                if with_input:
+                    output_images = torch.cat((input_images, output_image), dim=0)
+                else:
+                    output_images = output_image
+            else:
+                output_images = torch.cat((output_images, output_image), dim=0)
+        return output_images
+    
+    def get_trans_exemplar_set(self, images):
+        images = images.view(-1, self.args.input_size[0], self.args.input_size[1], self.args.input_size[2])
+        trans_images = self.images_transfroms(images, num_iter=10, with_input=False)
+        trans_images = trans_images.view(-1, np.prod(self.args.input_size))
+        # x to z
+        exemplars_z, log_variance = self.q_z(trans_images.float().to(self.args.device), prior=True)
+        if self.args.prior == 'h_vae':
+            exemplars_z = exemplars_z / exemplars_z.norm(dim=-1, keepdim=True)
+            log_variance = F.softplus(log_variance) + 1
+            
+        
+        exemplar_set = (exemplars_z, log_variance)
+
+        return exemplar_set
 
     def get_approximate_nearest_exemplars(self, z, cache, dataset):
         exemplars_indices = torch.randint(low=0, high=self.args.training_set_size,
@@ -269,5 +408,3 @@ class BaseModel(nn.Module, ABC):
         cached_z[exemplars_indices] = exemplars_z
         exemplar_set = (exemplars_z, log_variance, exemplars_indices)
         return exemplar_set
-
-
